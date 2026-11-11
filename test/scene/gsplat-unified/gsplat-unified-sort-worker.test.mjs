@@ -1,17 +1,21 @@
 import { expect } from 'chai';
 
+import { createGSplatSortCore } from '../../../src/scene/gsplat/gsplat-sort-core.js';
 import { GSplatSortBinWeights } from '../../../src/scene/gsplat-unified/gsplat-sort-bin-weights.js';
 import { UnifiedSortWorker } from '../../../src/scene/gsplat-unified/gsplat-unified-sort-worker.js';
 
 describe('UnifiedSortWorker', function () {
 
-    // The worker's creator injects the bin weights class into the worker's scope as source text
+    // The worker's creator injects the bin weights class and the shared sort core into the
+    // worker's scope as source text
     before(function () {
         globalThis.GSplatSortBinWeights = GSplatSortBinWeights;
+        globalThis.gsplatSortCore = createGSplatSortCore();
     });
 
     after(function () {
         delete globalThis.GSplatSortBinWeights;
+        delete globalThis.gsplatSortCore;
     });
 
     // Sorts one placement of splats at the given positions for a camera at the origin looking down

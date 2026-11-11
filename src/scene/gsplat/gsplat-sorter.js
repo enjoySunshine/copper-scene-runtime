@@ -1,6 +1,7 @@
 import { EventHandler } from '../../core/event-handler.js';
 import { platform } from '../../core/platform.js';
 import { UploadStream } from '../../platform/graphics/upload-stream.js';
+import { sortCoreSource } from './gsplat-sort-core.js';
 import { SortWorker } from './gsplat-sort-worker.js';
 
 /**
@@ -85,7 +86,12 @@ class GSplatSorter extends EventHandler {
         };
 
         const workerPort = platform.environment === 'node' ? 'require("node:worker_threads").parentPort' : 'self';
-        const workerSource = `(${SortWorker.toString()})(${workerPort})`;
+        // The shared sort core factory is stringified and instantiated once; the worker entry
+        // reads the primitives from the gsplatSortCore global. A single identifier crosses the
+        // source-text boundary, which survives minified identifier renaming.
+        const workerSource =
+            `${sortCoreSource}\nconst gsplatSortCore = createGSplatSortCore();\n` +
+            `(${SortWorker.toString()})(${workerPort})`;
 
         if (platform.environment === 'node') {
             this.worker = new Worker(workerSource, {

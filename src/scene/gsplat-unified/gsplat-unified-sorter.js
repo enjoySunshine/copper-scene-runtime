@@ -1,5 +1,6 @@
 import { EventHandler } from '../../core/event-handler.js';
 import { platform } from '../../core/platform.js';
+import { sortCoreSource } from '../gsplat/gsplat-sort-core.js';
 import { UnifiedSortWorker } from './gsplat-unified-sort-worker.js';
 import { GSplatSortBinWeights } from './gsplat-sort-bin-weights.js';
 
@@ -48,9 +49,13 @@ class GSplatUnifiedSorter extends EventHandler {
         super();
         this.scene = scene ?? null;
 
-        // Build worker source with GSplatSortBinWeights class injected via stringification.
+        // Build worker source with the shared sort core factory and the GSplatSortBinWeights class
+        // injected via stringification. Each crosses the source-text boundary as a single
+        // identifier (gsplatSortCore, GSplatSortBinWeights), which survives minified renaming.
         const workerPort = platform.environment === 'node' ? 'require("node:worker_threads").parentPort' : 'self';
         const workerSource = `
+            ${sortCoreSource}
+            const gsplatSortCore = createGSplatSortCore();
             const GSplatSortBinWeights = ${GSplatSortBinWeights.toString()};
             (${UnifiedSortWorker.toString()})(${workerPort})
         `;

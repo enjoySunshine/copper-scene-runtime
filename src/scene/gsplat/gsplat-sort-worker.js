@@ -2,6 +2,11 @@
 // `myself` is the worker's message port: `self` in a web worker, or the parentPort of a Node
 // worker_threads worker. The creator passes it in as source text, so that bundlers never see the
 // Node-only require.
+//
+// The shared sorting core is injected into the worker scope by gsplat-sorter.js as source text and
+// instantiated into the gsplatSortCore global; see gsplat-sort-core.js for the stringification
+// constraints.
+/* global gsplatSortCore */
 function SortWorker(myself) {
 
     let order;
@@ -23,25 +28,12 @@ function SortWorker(myself) {
     let countBuffer;
 
     // could be increased, but this seems a good compromise between stability and performance
-    const numBins = 32;
+    const numBins = gsplatSortCore.numBins;
     const binCount = new Array(numBins).fill(0);
     const binBase = new Array(numBins).fill(0);
     const binDivider = new Array(numBins).fill(0);
 
-    const binarySearch = (m, n, compare_fn) => {
-        while (m <= n) {
-            const k = (n + m) >> 1;
-            const cmp = compare_fn(k);
-            if (cmp > 0) {
-                m = k + 1;
-            } else if (cmp < 0) {
-                n = k - 1;
-            } else {
-                return k;
-            }
-        }
-        return ~m;
-    };
+    const binarySearch = gsplatSortCore.binarySearch;
 
     const update = () => {
         if (!order || !centers || centers.length === 0 || !cameraPosition || !cameraDirection) return;
@@ -95,19 +87,13 @@ function SortWorker(myself) {
         const numVertices = centers.length / 3;
 
         // calculate number of bits needed to store sorting result
-        const compareBits = Math.max(10, Math.min(20, Math.round(Math.log2(numVertices / 4))));
+        const compareBits = gsplatSortCore.compareBits(numVertices);
         const bucketCount = 2 ** compareBits + 1;
 
         // create distance buffer
-        if (distances?.length !== numVertices) {
-            distances = new Uint32Array(numVertices);
-        }
-
-        if (!countBuffer || countBuffer.length !== bucketCount) {
-            countBuffer = new Uint32Array(bucketCount);
-        } else {
-            countBuffer.fill(0);
-        }
+        const buffers = gsplatSortCore.allocSortBuffers(distances, countBuffer, numVertices, bucketCount);
+        distances = buffers.distances;
+        countBuffer = buffers.countBuffer;
 
         const range = maxDist - minDist;
 
@@ -156,8 +142,7 @@ function SortWorker(myself) {
                 const y = centers[ii++];
                 const z = centers[ii++];
                 const d = (x * dx + y * dy + z * dz - minDist) / binRange;
-                const bin = d >>> 0;
-                const sortKey = (binBase[bin] + binDivider[bin] * (d - bin)) >>> 0;
+                const sortKey = gsplatSortCore.linearSortKey(d, binBase, binDivider);
 
                 distances[i] = sortKey;
 
@@ -166,17 +151,8 @@ function SortWorker(myself) {
             }
         }
 
-        // Change countBuffer[i] so that it contains actual position of this digit in outputArray
-        for (let i = 1; i < bucketCount; i++) {
-            countBuffer[i] += countBuffer[i - 1];
-        }
-
-        // Build the output array
-        for (let i = 0; i < numVertices; i++) {
-            const distance = distances[i];
-            const destIndex = --countBuffer[distance];
-            order[destIndex] = i;
-        }
+        // counting sort over the distance keys; no indexMap, so output indices are splat indices
+        gsplatSortCore.countingSort(bucketCount, countBuffer, numVertices, distances, order, null, { value: false });
 
         // Find splat with distance 0 to limit rendering behind the camera
         const cameraDist = px * dx + py * dy + pz * dz;

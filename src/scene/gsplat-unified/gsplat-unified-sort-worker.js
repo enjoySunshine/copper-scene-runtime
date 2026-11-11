@@ -1,6 +1,11 @@
 // `myself` is the worker's message port: `self` in a web worker, or the parentPort of a Node
 // worker_threads worker. The creator passes it in as source text, so that bundlers never see the
 // Node-only require.
+//
+// The shared sorting core is injected into the worker scope by gsplat-unified-sorter.js as source
+// text and instantiated into the gsplatSortCore global; see gsplat-sort-core.js for the
+// stringification constraints. GSplatSortBinWeights is injected the same way by the sorter.
+/* global gsplatSortCore, GSplatSortBinWeights */
 function UnifiedSortWorker(myself) {
 
     // cache of centers for each splat id
@@ -28,12 +33,11 @@ function UnifiedSortWorker(myself) {
     // bin index 32 instead of 31. The GPU compute shader avoids this by clamping,
     // but the CPU path uses truncation which can overflow. The safety entry at [32]
     // ensures valid array access without bounds checking in the hot loop.
-    const numBins = 32;
+    const numBins = gsplatSortCore.numBins;
     const binBase = new Float32Array(numBins + 1);
     const binDivider = new Float32Array(numBins + 1);
 
     // Shared bin weights utility (class is injected via stringification from main thread)
-    // eslint-disable-next-line no-undef
     const binWeightsUtil = new GSplatSortBinWeights();
 
     /**
@@ -112,8 +116,7 @@ function UnifiedSortWorker(myself) {
 
                     // Bin-based mapping
                     const d = dist * invBinRange;
-                    const bin = d >>> 0;
-                    const sortKey = (binBase[bin] + binDivider[bin] * (d - bin)) >>> 0;
+                    const sortKey = gsplatSortCore.linearSortKey(d, binBase, binDivider);
 
                     distances[compactIdx++] = sortKey;
                     countBuffer[sortKey]++;
@@ -126,66 +129,6 @@ function UnifiedSortWorker(myself) {
     // scratch for reading a float's bit pattern, see logSortKeys
     const floatBits = new Float32Array(1);
     const floatBitsI32 = new Int32Array(floatBits.buffer);
-
-    // Turns the distances written as floats over the key buffer into sort keys spaced by log
-    // distance, in place (same as the projector shader). A positive float's bit pattern grows with
-    // its value almost exactly as its log2, so keys taken from the bits give every doubling of
-    // distance the same number of keys, and splats far away cost no precision near the camera. The
-    // bits are measured from those of `nearValue`, and inverted so far splats sort first. Writing
-    // all the distances first costs less than reading the bits back a splat at a time.
-    const logSortKeys = (nearValue, farValue, maxKey, distances, countBuffer) => {
-        floatBits[0] = nearValue;
-        const minBits = floatBitsI32[0];
-        floatBits[0] = farValue;
-        const bitsRange = floatBitsI32[0] - minBits;
-        const keyScale = bitsRange > 0 ? maxKey / bitsRange : 0;
-
-        for (let i = 0; i < distances.length; i++) {
-            const keyFromNear = (distances[i] - minBits) * keyScale;
-            const sortKey = maxKey - (keyFromNear <= 0 ? 0 : (keyFromNear >= maxKey ? maxKey : keyFromNear >>> 0));
-            distances[i] = sortKey;
-            countBuffer[sortKey]++;
-        }
-    };
-
-    // Same as logSortKeys for signed depths, whose negative values (the splats behind the camera)
-    // take the last `behindKeys` keys, spaced the same way out to `behindValue`, so they sort after
-    // the rest in the order of their signed depth. A loop of its own, as the sign test slows the
-    // radial keys' loop down. The sign picks each key's scale, clamp and direction arithmetically:
-    // a branch on it runs at half the speed, and slower still when splats in front of the camera
-    // and behind it are interleaved.
-    const signedLogSortKeys = (nearValue, farValue, behindValue, behindKeys, maxKey, distances, countBuffer) => {
-        floatBits[0] = nearValue;
-        const minBits = floatBitsI32[0];
-        floatBits[0] = farValue;
-        const bitsRange = floatBitsI32[0] - minBits;
-        floatBits[0] = behindValue;
-        const behindBitsRange = floatBitsI32[0] - minBits;
-
-        // the nearest key in front of the camera, and the last behind it, counted from the first
-        const nearestKey = maxKey - behindKeys;
-        const lastBehindKey = behindKeys - 1;
-        const keyScale = bitsRange > 0 ? nearestKey / bitsRange : 0;
-        const behindKeyScale = behindBitsRange > 0 ? lastBehindKey / behindBitsRange : 0;
-        const behindScaleStep = behindKeyScale - keyScale;
-        const behindLimitStep = lastBehindKey - nearestKey;
-
-        // read as int32, so the sign bit is never a float
-        const keys = new Int32Array(distances.buffer, distances.byteOffset, distances.length);
-        for (let i = 0; i < keys.length; i++) {
-            const bits = keys[i];
-
-            // 1 behind the camera, 0 in front; the bits of the magnitude are measured from the near
-            // value's, and a key behind counts up from the one after the nearest, in front down
-            const behind = bits >>> 31;
-            const keyFromNear = ((bits & 0x7fffffff) - minBits) * (keyScale + behind * behindScaleStep);
-            const limit = nearestKey + behind * behindLimitStep;
-            const key = keyFromNear <= 0 ? 0 : (keyFromNear >= limit ? limit : keyFromNear >>> 0);
-            const sortKey = nearestKey + behind + (2 * behind - 1) * key;
-            keys[i] = sortKey;
-            countBuffer[sortKey]++;
-        }
-    };
 
     // Radial keys from the squared distance, whose bits follow log2 as well.
     const evaluateSortKeysRadial = (sortParams, nearDist, maxDist, maxKey, distances, countBuffer, centersData) => {
@@ -215,7 +158,7 @@ function UnifiedSortWorker(myself) {
                 return compactIdx;
             });
 
-        logSortKeys(nearDist * nearDist, maxDist * maxDist, maxKey, distances, countBuffer);
+        gsplatSortCore.logSortKeys(nearDist * nearDist, maxDist * maxDist, maxKey, distances, countBuffer, floatBits, floatBitsI32);
     };
 
     // Depth keys of a perspective camera, from the signed depth in front of it. The sort direction
@@ -242,30 +185,7 @@ function UnifiedSortWorker(myself) {
                 return compactIdx;
             });
 
-        signedLogSortKeys(nearDist, -minDist, maxDist, (maxKey + 1) >>> 4, maxKey, distances, countBuffer);
-    };
-
-    const countingSort = (bucketCount, countBuffer, numVertices, distances, order) => {
-
-        // accumulate counts
-        for (let i = 1; i < bucketCount; i++) {
-            countBuffer[i] += countBuffer[i - 1];
-        }
-
-        // fast check: after cumulative sum, last bucket = total valid splats
-        // If less than numVertices, some sortKeys were out of bounds (AABB issue)
-        const validCount = countBuffer[bucketCount - 1];
-        if (validCount !== numVertices && !_warnedSortKeyOverflow) {
-            _warnedSortKeyOverflow = true;
-            console.warn(`[SortWorker] ${numVertices - validCount} splats lost due to sortKey overflow. Check resource AABB bounds contain all the splats.`);
-        }
-
-        // build output array — map through indexMap to get work-buffer pixel indices
-        for (let i = 0; i < numVertices; i++) {
-            const distance = distances[i];
-            const destIndex = --countBuffer[distance];
-            order[destIndex] = indexMap[i];
-        }
+        gsplatSortCore.signedLogSortKeys(nearDist, -minDist, maxDist, (maxKey + 1) >>> 4, maxKey, distances, countBuffer, floatBits, floatBitsI32);
     };
 
     // compute min/max effective distance using 8-corner local AABB projection per splat
@@ -357,7 +277,7 @@ function UnifiedSortWorker(myself) {
         const numVertices = centersData.totalActiveSplats;
 
         // calculate number of bits needed to store sorting result
-        const compareBits = Math.max(10, Math.min(20, Math.round(Math.log2(numVertices / 4))));
+        const compareBits = gsplatSortCore.compareBits(numVertices);
 
         // Radial keys, and the depth keys of a perspective camera, are log spaced (an orthographic
         // or fisheye camera can draw splats at or behind it, so its depth keys keep the bins). They
@@ -371,15 +291,9 @@ function UnifiedSortWorker(myself) {
         const bucketCount = 2 ** keyBits + 1;
 
         // create distance buffer
-        if (distances?.length !== numVertices) {
-            distances = new Uint32Array(numVertices);
-        }
-
-        if (!countBuffer || countBuffer.length !== bucketCount) {
-            countBuffer = new Uint32Array(bucketCount);
-        } else {
-            countBuffer.fill(0);
-        }
+        const buffers = gsplatSortCore.allocSortBuffers(distances, countBuffer, numVertices, bucketCount);
+        distances = buffers.distances;
+        countBuffer = buffers.countBuffer;
 
         // Log keys start ten doublings inside the near clip: the splats closer than it are drawn
         // too, with their depth clamped, so they need an order. An orthographic near clip can be
@@ -394,7 +308,6 @@ function UnifiedSortWorker(myself) {
             const range = maxDist - minDist;
 
             // Set up camera-relative bin weighting for near-camera precision (using shared utility)
-            // eslint-disable-next-line no-undef
             const cameraBin = GSplatSortBinWeights.computeCameraBin(minDist, range);
 
             // Compute bin weights locally using shared utility
@@ -404,7 +317,11 @@ function UnifiedSortWorker(myself) {
             evaluateSortKeysLinear(sortParams, minDist, range, distances, countBuffer, centersData);
         }
 
-        countingSort(bucketCount, countBuffer, numVertices, distances, order);
+        // the warning flag is shared through a mutable holder so it stays inside the stringifiable
+        // shared core; copy its (possibly updated) value back afterwards
+        const overflowState = { value: _warnedSortKeyOverflow };
+        gsplatSortCore.countingSort(bucketCount, countBuffer, numVertices, distances, order, indexMap, overflowState);
+        _warnedSortKeyOverflow = overflowState.value;
 
         const count = numVertices;
 
